@@ -28,7 +28,7 @@ We haven't really experienced any serious issues caused by large cross-shard tra
 
 #### Why is the current solution inadequate?
 
-There is a rudimentary solution in place, added together with stateless validation to limit witnes size in [NEP-509](https://github.com/near/NEPs/blob/master/neps/nep-0509.md).
+There is a rudimentary solution in place, added together with stateless validation in [NEP-509](https://github.com/near/NEPs/blob/master/neps/nep-0509.md) to limit witnes size.
 In this solution each shard is usually allowed to send 100KiB (`outgoing_receipts_usual_size_limit`) of receipts to another shard, but there's one special shard that is allowed to send 4.5MiB (`outgoing_receipts_big_size_limit`). The special allowed shard is switched on every height in a round robin fashion. If a shards wants to send less than 100KiB it can just do it, but for larger transfers the sender needs to wait until it's the allowed shard to send the receipts. A node can only send more than 100KiB on its turn. See the PR for a more detailed description of the solution: https://github.com/near/nearcore/pull/11492
 
 This solution was simple enough to be implemented before stateless validation launch, but there is a number of issues with this approach:
