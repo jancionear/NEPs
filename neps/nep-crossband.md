@@ -12,11 +12,31 @@ LastUpdated: 2024-08-13
 
 ## Summary
 
-[Provide a short human-readable (~200 words) description of the proposal. A reader should get from this section a high-level understanding about the issue this NEP is addressing.]
+When a chunk is applied it produces outgoing receipts that are sent to other shards. The size of receipts to send could potentially be large and the shard might not be able to transfer all of the receipts before the next block, which could result in missing chunks. The incoming receipts are also included in the `ChunkStateWitness` and we must make sure that its size stays under control. Let's limit how many receipts can be sent out to make sure that the nodes have enough bandwidth to send them in time.
+We already implemented a basic version of bandwidth limits in the stateless validation NEP ([NEP-509](https://github.com/near/NEPs/blob/master/neps/nep-0509.md)), but it's very barebones, it severely limits the bandwidth to stay on the safe side. Let's implement a proper solution to support higher cross-shard bandwidth.
 
 ## Motivation
 
-[Explain why this proposal is necessary, how it will benefit the NEAR protocol or community, and what problems it solves. Also describe why the existing protocol specification is inadequate to address the problem that this NEP solves, and what potential use cases or outcomes.]
+#### Why do we need bandwidth limits?
+
+NEAR is a sharded blockchain - every shard is expected to do a limited amount of work at every height. Scaling is mostly achieved by adding more shards. This also means that we cannot expect a shard to send or receive more than X MB of data at every height. Without bandwidth limits some shards might be forced to do a lot of work, more than the shard is capable. Asking the shard to process more work than it can handle would result in delays, missed chunks and possibly even chain stalls. It makes sense to add a limit on how much the shard sends/receives at every height, it's in line with NEAR's design.
+
+We haven't really experienced any serious issues caused by large cross-shard traffic in mainnet, but recent protocol changes have caused the issue to become more a cause for concern:
+* With stateless validation all of the incoming receipts are kept inside `ChunkStateWitness`. The protocol is very sensitive to the size of `ChunkStateWitness` - when `ChunkStateWitness` becomes too large the nodes are not able to distribute it in time and there are chunk misses, in extreme cases a shard can even stall. We have to make sure that the size of incoming receipts is limited to avoid witness size issues and attacks.
+* The number of incoming receipts to a shard scales linearly with the number of shards - the more shards there are, the more receipts they send. As we add more and more shards the size of incoming receipts will become more of an issue, at some point we'd have to introduce the limits to prevent nodes from getting overloaded by incoming receipts. Without these limits NEAR is not scalable. In the last year the number of shards increased by 50%, we might get to 10 shards by the end of year. We need NEAR to be scalable if we want to keep increasing the number of shards.
+
+
+#### Why is the current solution inadequate?
+
+There is a rudimentary solution in place, added together with stateless validation to limit witnes size in [NEP-509](https://github.com/near/NEPs/blob/master/neps/nep-0509.md).
+In this solution each shard is usually allowed to send 100KiB (`outgoing_receipts_usual_size_limit`) of receipts to another shard, but there's one special shard that is allowed to send 4.5MiB (`outgoing_receipts_big_size_limit`). The special allowed shard is switched on every height in a round robin fashion. If a shards wants to send less than 100KiB it can just do it, but for larger transfers the sender needs to wait until it's the allowed shard to send the receipts. A node can only send more than 100KiB on its turn. See the PR for a more detailed description of the solution: https://github.com/near/nearcore/pull/11492
+
+This solution was simple enough to be implemented before stateless validation launch, but there is a number of issues with this approach:
+* Small throughput - If we take two shards - `1` and `2`, then `1` is able to send at most 5MiB of data to `2` every 6 blocks (assuming 6 shards). That's only 800KiB / height, even though in theory NEAR could support 5MiB / height (assuming that other shards aren't sending much). That's a lot unused throughput that we can't make use of because of the overly restrictive limits. There are some use cases that could make use of higher throughput, e.g NEAR DA, although last I heard NEAR DA was moving to a design that doesn't require a lot of cross-shard bandwidth.
+* Hiccups on large receipts - when a receipt is larger than 100KiB it can't be sent until the sender is the allowed shard, which could take up to `num_shards` blocks. The outgoing receipt queue is a FIFO queue, so all the other receipts are stuck behind the large receipt as well. This means that a single large receipt can block all outgoing receipts for a few blocks. This is undesirable because it increases latency for all these receipts and makes DoS attacks easier. The problem will become more pronounced once more shards are added. On current mainnet traffic receipts larger than 100KiB occur about once per 1000 blocks, so it's not that big of an issue, but this could change in the future.
+* Missing chunks - when a chunk is missing, the next chunk receives both the receipts aimed at the previous chunk and the new one. If there were a few missing chunks in a row, the next chunk will receive incoming receipts from all of the missing ones. We must make sure that the total size of incoming receipts from all these heights doesn't get too large. The current solution deals with this by marking a shard as congested if there were too many missing chunks in a row. A fully congested shard can't receive any receipts, so after a few heights other shards will stop sending receipts to the shard with missing chunks. The shard will receive receipts from a few heights at most. This makes the problem smaller, but doesn't fully fix it. Receipts from multiple heights could still add up to over 15MB, which is quite large. There are also issues with allowed shard, which is allowed to send receipts to fully congested shards, which could make the problem worse in some corner cases.
+
+The current solution has many deficiencies that could be solved by a better approach.
 
 ## Specification
 
