@@ -40,6 +40,55 @@ The current solution has many deficiencies that could be solved by a better appr
 
 ## Specification
 
+The main source of wasted bandwidth is that assigning bandwidth doesn't take into account the needs of individual shards. When shard `1` needs to send 500KiB and shard `2` needs to send 20KiB the algorithm can assign all of the bandwidth to shard `2` even though it doesn't really need it, it just happened to be the allowed shard at this height. This is wasteful, it would be much better if the algorithm could see how much each shard needs and give to each according to their needs.
+This is the general idea behind the new solution: each shard requests bandwidth according to its needs and bandwidth scheduler divides the bandwidth between everone that requested it. The bandwidth scheduler would be able to see that shard `2` needs 500KiB of bandwidth and it'd give it to `2`.
+The flow will look like this:
+* A chunk is applied and produces outgoing receipts to other shards.
+* The shard calculates the current limits and sends as many receipts as it's allowed to.
+* The receipts that can't be sent due to limits are buffered (saved to state), they will be sent later.
+* The shard calculates how much bandwidth it needs to send the buffered receipts and creates a `BandwidthRequest` with this information (there's one `BandwidthRequest` per target shard).
+* The list of `BandwidthRequest` from this shard is included in the chunk header and distributed to other nodes.
+* When the next chunk is applied it gathers all the `BandwidthRequests` from chunk headers at the previous height(s) and uses `BandwidthScheduler` to calculate the current bandwidth limits in a deterministic way. The same calculation is performed on all shards and all shards arrive at the same bandwidth limits.
+* The chunk is applied and produces outoging receipts, receipts are sent until they hit the limits set by `BandwidthScheduler`.
+
+### `BandwidthRequest`
+
+A shard looks at its queue of buffered receipts to another shard and generates a `BandwidthRequest` which describes how much bandwidth the shard would like to have.
+In the simplest version a `BandwidthRequest` could be a single integer containing the total size of buffered receipts.
+But there is a problem with this simple representation - it doesn't say anything about the size of individual receipts. Let's say that two shards want to send 4MB of data each to another shard, but the incoming limit is 5MB. Should we assign 2.5MB of bandwidth to each of the sender shards? That would work if the shards want to send a lot of small receipts, but it wouldn't work when each shard wants to send a single 4MB receipt. A shard can't send a part of the 4MB receipt, it's either the whole receipt or nothing. The scheduler should assign 2.5MB/2.5MB of bandwidth when the receipts are small and 4MB/0MB when they're large. The simple version doesn't have enough information for the scheduler to make the right decision, so we'll use a richer representation.
+
+The richer reprenentation is a list of possible bandwidths that the shard would like to receive. When a shard has a lot of small receipts in the queue the list could look like this: [100kB, 200kB, 300kB, ..., 3.9MB, 4MB]. When there's one huge receipt the list would be: [4MB] (receiving e.g. 100kB of bandwidth would be useless, so there's only 4MB in the list of options). Shards are able to tell the scheduler what bandwidth assignments make sense for their requests and the bandwidth scheduler is able to assign one of the sensible possibilities for every request.
+
+Conceptually a `BandwidthRequest` looks like this:
+```rust
+struct BandwidthRequest {
+    /// Requesting bandwidth to this shard
+    to_shard: ShardId,
+    /// Please grant me one of the options listed here.
+    possible_bandwidth_grants: Vec<usize>
+}
+```
+
+A list of such requests will be included in the chunk header:
+```rust
+struct ChunkHeader {
+    bandwidth_requests: Vec<BandwidthRequest>
+}
+```
+
+With this representation of `BandwidthRequest` the list of bandwidth requests could take up a lot of space in the chunk header. Luckily it's possible to significantly reduce its size using a better representation.
+First we could use `u8` instead `u64` for the `ShardId`, NEAR currently has only 6 shards and it'll take a while to reach 255. There's no need to handle 10**18 shards.
+Second we can use a bitmask for the `possible_bandwidth_grants`. The requests don't have to be very precise, 100kB granularity would be sufficient. Assuming that the maximum grant is 4.5MB, we could use 45 bits to represent all posible requests. Having `1` in the `n-th` bit would mean that one of the options is `(n+1) * 100kB`. With these optimizations a single `BandwidthRequest` would be only 7 bytes in size. It's possible to further reduce the size by lowering granulariy and/or using exponential scale. TODO - decide on the exact representation used in the implementation and describe it here.
+
+Sending less than 100KiB of receipts won't require a `BandwidthRequest`. Every shard will be allowed to send this much without asking for permission. On current mainnet traffic the typical size of receipts to send is below 20kB, so on most heights there won't be any bandwidth requests. Bandwidth requests are needed only for exceptionally large transfers. This helps to save space inside chunk headers, we don't have to keep `num_shards**2` requests for every height.
+
+The exact algorithm for generating bandwidth requests will be described later.
+
+### `BandwidthScheduler`
+
+`BandwidthScheduler` is an algorithm which looks at all of the `BandwidthRequests` submitted by shards and grants the bandwidth in a fair way.
+
+
 [Explain the proposal as if you were teaching it to another developer. This generally means describing the syntax and semantics, naming new concepts, and providing clear examples. The specification needs to include sufficient detail to allow interoperable implementations getting built by following only the provided specification. In cases where it is infeasible to specify all implementation details upfront, broadly describe what they are.]
 
 ## Reference Implementation
