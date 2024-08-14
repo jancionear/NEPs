@@ -88,6 +88,40 @@ The exact algorithm for generating bandwidth requests will be described later.
 
 `BandwidthScheduler` is an algorithm which looks at all of the `BandwidthRequests` submitted by shards and grants the bandwidth in a fair way.
 
+`BandwidthScheduler` has the following inputs:
+* A list of bandwidth requests from all shards
+* Incoming bandwidth limit for every shard (how much this shard can receive)
+* Outgoing bandwidth limit for every shard (hom much this shard can send out)
+
+Based on these inputs the scheduler chooses one of the possibilities for every request.
+The incoming and outgoing limits would usually be a constant value (e.g 5MB), but in some situations they can be smaller. For example if a shard had missing 
+chunks we would take into account how many receipts were already sent and decrease its incoming limit to avoid sending too many receipts to it.
+
+The algorithm works as follows:
+* Shuffle the list of bandwidth requests using a deterministic seed (e.g hash of he previous block)
+* Walk through the shuffled list and try to grant the first possibility from the request. Update the relevant incoming and outgoing limits.
+* Walk through the shuffled list again and try to grant the second possibility.
+* Repeat the process until no new possibilities can be granted.
+* Distribute the remaining bandwidth equally among all shards (including the ones that didn't request any)
+
+It's best to show on an example:
+
+<details>
+<summary>
+Click to show the example (lots of pictures)
+</summary>
+
+![](assets/nep-crossband/example0-pic0.png)
+![](assets/nep-crossband/example0-pic1.png)
+![](assets/nep-crossband/example0-pic2.png)
+![](assets/nep-crossband/example0-pic3.png)
+![](assets/nep-crossband/example0-pic4.png)
+![](assets/nep-crossband/example0-pic5.png)
+![](assets/nep-crossband/example0-pic6.png)
+![](assets/nep-crossband/example0-pic7.png)
+![](assets/nep-crossband/example0-pic8.png)
+</details>
+
 
 [Explain the proposal as if you were teaching it to another developer. This generally means describing the syntax and semantics, naming new concepts, and providing clear examples. The specification needs to include sufficient detail to allow interoperable implementations getting built by following only the provided specification. In cases where it is infeasible to specify all implementation details upfront, broadly describe what they are.]
 
