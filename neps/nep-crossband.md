@@ -125,6 +125,33 @@ Click to show the example (lots of pictures)
 
 [Explain the proposal as if you were teaching it to another developer. This generally means describing the syntax and semantics, naming new concepts, and providing clear examples. The specification needs to include sufficient detail to allow interoperable implementations getting built by following only the provided specification. In cases where it is infeasible to specify all implementation details upfront, broadly describe what they are.]
 
+### Missing chunks
+
+TODO
+
+### Congestion control
+
+The bandwidth scheduler has to be compatible with congestion control. When a shard is fully congested, other shards can't send any receipts to it unless they happen to be the allowed shard. It makes no sense to grant bandwidth to a shard which can't send any receipts because of congestion control. Not taking congestion control into account could lead to dangerous situations where all bandwidth is assigned to shards that can't send anything and no progress is made.
+We can deal with this by adjusting the incoming limits based on the congestion control information. The incoming limit for fully congested shards could be set to zero and then bandwidth scheduler won't assign any bandwidth there.
+
+### Generating bandwidth requests
+
+TODO
+
+### One block delay
+
+There's a one block dealy between requesting bandwidth and receiving a grant. This is not ideal, most large receipts will have to be buffered and sent out at the next height, it'd be nicer if we could quickly negotiate bandwidth and send them immediately.
+I don't really see a good way around it, it feels like a fundamental limitation - a shard doesn't know what other shards want to send so it needs to contact them and negotiate. Maybe it'd be possible to negotiate it off-chain inbetween blocks, but that sounds like a complex problem. The latency between nodes can be high, and it's hard to prove the negotiation, especially when missing chunks happen and we can't prove any information about their requests.
+The solution proposed in this NEP is simpler and should be good enough, even though it has a one block delay.
+
+At first glance it might seem that the delay prevents us from using 100% of the bandwidth - a big receipt takes 2 blocks to reach the other shard, doesn't that mean that we get only 50% of the theoretical throughput? Not really, the delay increases latency, but it doesn't affect throughput. An application that wants to utilize 100% of bandwidth can submit the receipts and they'll be queued and sent over utilizing 100% of the bandwidth, just with a one block delay. There's no 50% problem.
+As an example one can imagine a contract that wants to send 4MB of data to another shard at every height. The contract will produce a 4MB receipt at every height, the shard will generate a 4MB `BandwidthRequest` at every height, and the bandwidth scheduler will grant the shard 4MB of bandwidth at every height (assuming no requests from other shards). At the first height the 4MB will be buffered, but for all the following heights the shard will have the 4MB grant and it'll be able to send 4MB of data to the other shard.
+We can utilize 100% of the bandwidth despite the delay, we just have to make sure that we can buffer ~10MB of receipts in the outgoing queue.
+
+### Transaction priorities
+
+[NEP-541](https://github.com/near/NEPs/pull/541)
+
 ## Reference Implementation
 
 [This technical section is required for Protocol proposals but optional for other categories. A draft implementation should demonstrate a minimal implementation that assists in understanding or implementing this proposal. Explain the design in sufficient detail that:
@@ -143,10 +170,13 @@ The section should return to the examples given in the previous section, and exp
 
 ## Alternatives
 
+### Partial receipts
 [Explain any alternative designs that were considered and the rationale for not choosing them. Why your design is superior?]
 
 ## Future possibilities
 
+
+### Better scheduling algorithm
 [Describe any natural extensions and evolutions to the NEP proposal, and how they would impact the project. Use this section as a tool to help fully consider all possible interactions with the project in your proposal. This is also a good place to "dump ideas"; if they are out of scope for the NEP but otherwise related. Note that having something written down in the future-possibilities section is not a reason to accept the current or a future NEP. Such notes should be in the section on motivation or rationale in this or subsequent NEPs. The section merely provides additional information.]
 
 ## Consequences
