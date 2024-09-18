@@ -63,7 +63,7 @@ In the simplest version a `BandwidthRequest` could be a single integer containin
 But there is a problem with this simple representation - it doesn't say anything about the size of individual receipts. Let's say that two shards want to send 4MB of data each to another shard, but the incoming limit is 5MB. Should we assign 2.5MB of bandwidth to each of the sender shards? That would work if the shards want to send a lot of small receipts, but it wouldn't work when each shard wants to send a single 4MB receipt. A shard can't send a part of the 4MB receipt, it's either the whole receipt or nothing. The scheduler should assign 2.5MB/2.5MB of bandwidth when the receipts are small and 4MB/0MB when they're large. The simple version doesn't have enough information for the scheduler to make the right decision, so we'll use a richer representation.
 
 TODO: Make this section clearer \/
-The richer reprenentation is a list of possible bandwidths that the shard would like to receive. When a shard has a lot of small receipts in the queue the list could look like this: [100kB, 200kB, 300kB, ..., 3.9MB, 4MB]. When there's one huge receipt the list would be: [4MB] (receiving e.g. 100kB of bandwidth would be useless, so there's only 4MB in the list of options). Shards are able to tell the scheduler what bandwidth assignments make sense for their requests and the bandwidth scheduler is able to assign one of the sensible possibilities for every request.
+The richer reprenentation is a list of possible bandwidths that the shard would like to receive. When a shard has a lot of small receipts in the queue, the list could look like this: [100kB, 200kB, 300kB, ..., 3.9MB, 4MB]. When there's one huge receipt the list would be: [4MB] (receiving e.g. 100kB of bandwidth would be useless, so there's only 4MB in the list of options). Shards are able to tell the scheduler what bandwidth assignments make sense for their requests and the bandwidth scheduler is able to assign one of the sensible options for every request.
 
 Conceptually a `BandwidthRequest` looks like this:
 
@@ -86,11 +86,123 @@ struct ChunkHeader {
 
 With this representation of `BandwidthRequest`, the list of bandwidth requests could take up a lot of space in the chunk header. Luckily it's possible to significantly reduce its size using a better representation.
 First we could use `u8` instead `u64` for the `ShardId`, NEAR currently has only 6 shards and it'll take a while to reach 255. There's no need to handle 10**18 shards.
-Second we can use a bitmask for the `possible_bandwidth_grants`. The requests don't have to be very precise, 100kB granularity would be sufficient. Assuming that the maximum grant is 4.5MB, we could use 45 bits to represent all posible requests. Having `1` in the `n-th` bit would mean that one of the options is `(n+1) * 100kB`. With these optimizations a single `BandwidthRequest` would be only 7 bytes in size. It's possible to further reduce the size by lowering granulariy and/or using exponential scale. TODO - decide on the exact representation used in the implementation and describe it here.
+Second we can use a bitmask for the `possible_bandwidth_grants`. The requests don't have to be very precise, 100kB granularity would be sufficient. Assuming that the maximum grant is 4.5MB, we could use 45 bits to represent all posible requests. Having `1` in the `n-th` bit would mean that one of the options is `(n+1) * 100kB`. With these optimizations a single `BandwidthRequest` would be only 7 bytes in size. It's possible to further reduce the size by lowering granulariy and/or using exponential scale. 
+
+So the actual representation of a `BandwidthRequest` would look something like this:
+```rust
+struct BandwidthRequest {
+    to_shard: u8,
+    possible_bandwidth_grants_bitmap: [u8; 6]
+}
+```
+TODO - decide on the exact representation used in the implementation and describe it here.
 
 Sending less than 100KiB of receipts won't require a `BandwidthRequest`. Every shard will be allowed to send this much without asking for permission. On current mainnet traffic the typical size of receipts to send is below 20kB, so on most heights there won't be any bandwidth requests. Bandwidth requests are needed only for exceptionally large transfers. This helps to save space inside chunk headers, we don't have to keep `num_shards**2` requests for every height.
 
-The exact algorithm for generating bandwidth requests will be described later.
+### Generating bandwidth requests
+
+To generate a bandwidth request the sender shard has to look at the receipts stored in the outgoing buffer to another shard and pick bandwdith grant options that make sense. In this context "makes sense" means that the having this much bandwidth would cause the sender to send more receipts than the previous requested option. So for example if the outgoing buffer contains two receipts of size 2MB, the requested options would be [2MB, 4MB]. 2.1MB wouldn't be an option because granting 2.1MB of bandwdith doesn't allow the shard to send out more than the 2MB option. Outgoing buffers with many small receipts would generate a lot of options, in there increasing the grant by 100kB often allows to tens of additional receipts.
+
+The simplest implementation would be to actually walk through the list of outgoing recepipts (starting from the ones that will be sent the soonest) and create a new option every time the total size increases by at least 100kB, like so:
+
+```rust
+/// Generate a bitmap of bandwidth requests based on the size of receipts stored in the outgoing buffer.
+/// Returns a bitmap with requests.
+/// request_bitmap[i] is true when the shard is requesting `(i+1) * 100kB` of bandwidth
+fn make_bandwidth_request(buffered_receipts: Vec<Receipt>) -> Vec<bool> {
+    let mut total_size: usize = 0;
+    let mut request_bitmap: Vec<bool> = vec![false; 46];
+    for receipt in buffered_receipts {
+        total_size += receipt_size(&receipt);
+        let size_index: usize = total_size / 100_000; // total size as a multiple of 100kB
+        if size_index < request_bitmap.len() {
+            request_bitmap[size_index] = true;
+        } else {
+            break; // Don't request more than 4.5MB, there's no point
+        }
+    }
+    request_bitmap[0] = false; // Don't request 100kB, everyone is granted this much by default
+    request_bitmap
+}
+```
+
+Walking over all receipts in the outgoing buffer is inefficient, so in reality it woud be better to implement a more efficient algorithm.
+
+One idea for a more efficient algorithm would be to group receipts into groups of at least 50kB and calculate bandwidth requests using these groups. When a new receipt is added to the outgoing buffer, its added to the last group of receipts. If the size of the group goes above 50kB, a new group is started. When a receipt is removed, it's removed from the first group. If the size of the first group reaches zero, the group is removed.
+The number of groups will be small - each group of receipts is at least 50kB, so for 10MB of receipts there will be at most 200 groups. A group is a simple u32, we could keep all the groups in a single trie value similar to `TrieIndices`.
+The groups produce less precise requests than individual receipts, but they're much more efficient.
+
+Example code:
+
+```rust
+
+struct OutgoingReceiptsBuffer {
+    receipts: VecDeque<Receipt>,
+    groups: VecDeque<ReceiptGroup>,
+}
+
+struct ReceiptGroup {
+    size: usize,
+}
+
+const RECEIPT_GROUP_SIZE: usize = 50_000;
+
+impl OutgoingReceiptsBuffer {
+    pub fn new() -> Self {
+        Self { receipts: VecDeque::new(), groups: VecDeque::new() }
+    }
+
+    pub fn push(&mut self, receipt: Receipt) {
+        let size = receipt_size(&receipt);
+
+        match self.groups.back_mut() {
+            Some(last_group) => {
+                last_group.size += size;
+
+                if last_group.size > RECEIPT_GROUP_SIZE {
+                    self.groups.push_back(ReceiptGroup { size: 0 });
+                }
+            }
+            None => {
+                self.groups.push_back(ReceiptGroup { size });
+            }
+        }
+
+        self.receipts.push_back(receipt);
+    }
+
+    pub fn pop(&mut self) -> Option<Receipt> {
+        let receipt = self.receipts.pop_front()?;
+
+        let first_group = self.groups.front_mut().unwrap();
+        first_group.size -= receipt_size(&receipt);
+
+        if first_group.size == 0 {
+            self.groups.pop_front();
+        }
+
+        Some(receipt)
+    }
+
+    pub fn make_bandwidth_request(&self) -> Vec<bool> {
+        let mut total_size: usize = 0;
+        let mut request_bitmap: Vec<bool> = vec![false; 45];
+        for group in &self.groups {
+            total_size += group.size;
+            let size_rounded: usize = total_size / 100_000; // total size as a multiple of 100kB
+            if size_rounded < request_bitmap.len() {
+                request_bitmap[size_rounded] = true;
+            } else {
+                break; // Don't request more than 4.5MB, there's no point
+            }
+        }
+        request_bitmap[0] = false; // Don't request bandwidth for the first 100kB
+        request_bitmap
+    }
+}
+```
+
+It's worth noting that for the initial implementation of bandwidth limits we don't need to implement proper request generation. We could generate just one option in every bandwidth request - total size of all receipts in the outgoing buffer. `BandwidthScheduler` will still work fine with that, it'll just be less efficient. We can add complex request generation in later versions and keep the initial one simple to reduce scope.
 
 ### `BandwidthScheduler`
 
@@ -115,6 +227,7 @@ The algorithm works as follows:
 
 It's best to show on an example:
 
+TODO - better description and example
 <details>
 <summary>
 Click to show the example (lots of pictures)
@@ -136,24 +249,17 @@ Click to show the example (lots of pictures)
 The bandwidth scheduler has to be compatible with congestion control. When a shard is fully congested, other shards can't send any receipts to it unless they happen to be the allowed shard. It makes no sense to grant bandwidth to a shard which can't send any receipts because of congestion control. Not taking congestion control into account could lead to dangerous situations where all bandwidth is assigned to shards that can't send anything and no progress is made.
 We can deal with this by adjusting the incoming limits based on the congestion control information. The incoming limit for fully congested shards could be set to zero and then bandwidth scheduler won't assign any bandwidth there.
 
-### Generating bandwidth requests
-
-TODO
-Save list of (queue index, 100kB) when receipts in the outgoing queue reach over 100kB 
-
 ### One block delay
 
 There's a one block dealy between requesting bandwidth and receiving a grant. This is not ideal, most large receipts will have to be buffered and sent out at the next height, it'd be nicer if we could quickly negotiate bandwidth and send them immediately.
 
-TODO: Fix up this section, Option C kinda deals with it.
-I don't really see a good way around it, it feels like a fundamental limitation - a shard doesn't know what other shards want to send so it needs to contact them and negotiate. Maybe it'd be possible to negotiate it off-chain inbetween blocks, but that sounds like a complex problem. The latency between nodes can be high, and it's hard to prove the negotiation, especially when missing chunks happen and we can't prove any information about their requests.
-The solution proposed in this NEP is simpler and should be good enough, even though it has a one block delay.
+It is a hard problem to solve - a shard doesn't know what other shards want to send, so it needs to contact them and negotiate. Maybe it'd be possible to negotiate it off-chain inbetween blocks, but that would be much more complex - we would have to make sure that the negotiation happens quickly even when latency between nodes is high and ensure that everything is fair and secure. The idea is explored furhter in `Option D` section, but for now I think we can go with a solution that is simpler and should be good enough, even though it has a one block delay.
 
 At first glance it might seem that the delay prevents us from using 100% of the bandwidth - a big receipt takes 2 blocks to reach the other shard, doesn't that mean that we get only 50% of the theoretical throughput? Not really, the delay increases latency, but it doesn't affect throughput. An application that wants to utilize 100% of bandwidth can submit the receipts and they'll be queued and sent over utilizing 100% of the bandwidth, just with a one block delay. There's no 50% problem.
 As an example one can imagine a contract that wants to send 4MB of data to another shard at every height. The contract will produce a 4MB receipt at every height, the shard will generate a 4MB `BandwidthRequest` at every height, and the bandwidth scheduler will grant the shard 4MB of bandwidth at every height (assuming no requests from other shards). At the first height the 4MB will be buffered, but for all the following heights the shard will have the 4MB grant and it'll be able to send 4MB of data to the other shard.
 We can utilize 100% of the bandwidth despite the delay, we just have to make sure that we can buffer ~10MB of receipts in the outgoing queue.
 
-Having one-block delay means that we still have the problem of hiccups when a large receipt blocks smaller receipts, but the problem is much smaller than before - the small receipts will have to wait for one block instead of `num_shards` blocks. One block delay isn't ideal, but it could be good enough. `num_shards` was concerning because the delay would get larger and larger as the number of shards grows, which isn't scalable at all.
+Having one-block delay means that we still have the problem of hiccups when a large receipt blocks smaller receipts, but the problem is much smaller than before - the small receipts will have to wait for one block instead of `num_shards` blocks. One block delay isn't ideal, but I think it's good enough. `num_shards` was more concerning because the delay would get larger and larger as the number of shards grows, which isn't scalable at all.
 We could consider having two different queues for small and big receipts to avoid small receipts getting stuck behind big ones, but this is a complex problem and it might not work well with transaction priorities. For now we'll stay with a single queue.
 
 ### Transaction priorities
