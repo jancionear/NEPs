@@ -66,11 +66,11 @@ The richer reprenentation is a list of possible bandwidth grants that make sense
 
 As an example, let's say that the outgoing receipts buffer has receipts with these sizes (receipts will be sent from left to right):
 ```
-[150kB, 60kB, 400kB, 1MB, 50kB, 300kB]
+[20kB, 150kB, 60kB, 400kB, 1MB, 50kB, 300kB]
 ```
 The cumulative sum (sum from 0 to i) of sizes is:
 ```
-[150kB, 210kB, 610kB, 1610kB, 1660kB, 1960kB]
+[20kB, 170kB, 230kB, 630kB, 1630kB, 1680kB, 1980kB]
 ```
 The bandwidth grant options in the generated `BandwidthRequest` will be:
 ```
@@ -78,10 +78,11 @@ The bandwidth grant options in the generated `BandwidthRequest` will be:
 ```
 
 Explanation:
-* Granting 200kB of bandwidth will allow to send the first receipt.
-* Granting 300kB will allow to send the first two receipts.
+* There's no 100kB option because all shards are allowed to send 100kB of receipts much by default, it doesn't require a request.
+* Granting 200kB of bandwidth will allow to send the first two receipts.
+* Granting 300kB will allow to send the first three receipts.
 * Granting 400kB would give the same result as 300kB, so it's not included in the options
-* Granting 700kB would allow to send the frist three receipts
+* Granting 700kB would allow to send the first four receipts
 * etc etc
 
 Conceptually a `BandwidthRequest` looks like this:
