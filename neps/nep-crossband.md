@@ -56,6 +56,10 @@ The flow will look like this:
 - When the next chunk is applied it gathers all the `BandwidthRequests` from chunk headers at the previous height(s) and uses `BandwidthScheduler` to calculate the current bandwidth limits in a deterministic way. The same calculation is performed on all shards and all shards arrive at the same bandwidth limits.
 - The chunk is applied and produces outoging receipts, receipts are sent until they hit the limits set by `BandwidthScheduler`.
 
+![](assets/nep-crossband/basic-flow.png)
+
+Details will be explained in the following sections.
+
 ### `BandwidthRequest`
 
 A shard looks at its queue of buffered receipts to another shard and generates a `BandwidthRequest` which describes how much bandwidth the shard would like to have.
@@ -295,7 +299,7 @@ When a chunk is missing, the incoming receipts that were aimed at this chunk are
 
 Sadly `BandwidthScheduler` doesn't have the ability to ensure that the situation where receipts aimed at two chunks end up aimed at one chunk never happens. When it decides how much receipts to send it doesn't know if the current chunk will be missing.
 
-TODO: Image here
+![](assets/nep-crossband/missing-chunk-double-receipts.png)
 
 The only thing `BandwidthScheduler` can do is stop sending receipts when it notices that it sent too many of them. The simplest way to do it would be a condition like `if (previous_chunk_missing_on_target_shard) {dont_send_anything();}`. A more complicated solution would look how much was already sent to the target shard and make sure that when we send new receipts the amount of unprocessed receipts doesn't grow too large.
 TODO - describe how `BandwidthScheduler` should handle missing chunks in detail, add some diagrams
