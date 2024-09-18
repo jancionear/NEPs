@@ -62,8 +62,27 @@ A shard looks at its queue of buffered receipts to another shard and generates a
 In the simplest version a `BandwidthRequest` could be a single integer containing the total size of buffered receipts.
 But there is a problem with this simple representation - it doesn't say anything about the size of individual receipts. Let's say that two shards want to send 4MB of data each to another shard, but the incoming limit is 5MB. Should we assign 2.5MB of bandwidth to each of the sender shards? That would work if the shards want to send a lot of small receipts, but it wouldn't work when each shard wants to send a single 4MB receipt. A shard can't send a part of the 4MB receipt, it's either the whole receipt or nothing. The scheduler should assign 2.5MB/2.5MB of bandwidth when the receipts are small and 4MB/0MB when they're large. The simple version doesn't have enough information for the scheduler to make the right decision, so we'll use a richer representation.
 
-TODO: Make this section clearer \/
-The richer reprenentation is a list of possible bandwidths that the shard would like to receive. When a shard has a lot of small receipts in the queue, the list could look like this: [100kB, 200kB, 300kB, ..., 3.9MB, 4MB]. When there's one huge receipt the list would be: [4MB] (receiving e.g. 100kB of bandwidth would be useless, so there's only 4MB in the list of options). Shards are able to tell the scheduler what bandwidth assignments make sense for their requests and the bandwidth scheduler is able to assign one of the sensible options for every request.
+The richer reprenentation is a list of possible bandwidth grants that make sense for this shard. When a shard wants to send a single 4MB receipt it doesn't make sense to assign it 100kB or 2MB of bandwidth, so it's list of possible grants that make sense will contain a single entry: [4MB]. OTOH when a shard wants to send a ton of small receipts, its list of possible grants will contain all possible options: [200kB, 300kB, 400kB, ..., 3900kB, 4MB]. When there are many small receipts increasing the bandwidth grant by 100kB allows to sends more receipts, so it makes sense to communicate that assigning 100kB more makes sense. In the single receipt example increasing the grant by 100kB wouldn't change anything, so it's not included in the sensible options.
+
+As an example, let's say that the outgoing receipts buffer has receipts with these sizes (receipts will be sent from left to right):
+```
+[150kB, 60kB, 400kB, 1MB, 50kB, 300kB]
+```
+The cumulative sum (sum from 0 to i) of sizes is:
+```
+[150kB, 210kB, 610kB, 1610kB, 1660kB, 1960kB]
+```
+The bandwidth grant options in the generated `BandwidthRequest` will be:
+```
+[200kB, 300kB, 700kB, 1700kB, 2000kB]
+```
+
+Explanation:
+* Granting 200kB of bandwidth will allow to send the first receipt.
+* Granting 300kB will allow to send the first two receipts.
+* Granting 400kB would give the same result as 300kB, so it's not included in the options
+* Granting 700kB would allow to send the frist three receipts
+* etc etc
 
 Conceptually a `BandwidthRequest` looks like this:
 
@@ -95,13 +114,12 @@ struct BandwidthRequest {
     possible_bandwidth_grants_bitmap: [u8; 6]
 }
 ```
-TODO - decide on the exact representation used in the implementation and describe it here.
 
 Sending less than 100KiB of receipts won't require a `BandwidthRequest`. Every shard will be allowed to send this much without asking for permission. On current mainnet traffic the typical size of receipts to send is below 20kB, so on most heights there won't be any bandwidth requests. Bandwidth requests are needed only for exceptionally large transfers. This helps to save space inside chunk headers, we don't have to keep `num_shards**2` requests for every height.
 
 ### Generating bandwidth requests
 
-To generate a bandwidth request the sender shard has to look at the receipts stored in the outgoing buffer to another shard and pick bandwdith grant options that make sense. In this context "makes sense" means that the having this much bandwidth would cause the sender to send more receipts than the previous requested option. So for example if the outgoing buffer contains two receipts of size 2MB, the requested options would be [2MB, 4MB]. 2.1MB wouldn't be an option because granting 2.1MB of bandwdith doesn't allow the shard to send out more than the 2MB option. Outgoing buffers with many small receipts would generate a lot of options, in there increasing the grant by 100kB often allows to tens of additional receipts.
+To generate a bandwidth request the sender shard has to look at the receipts stored in the outgoing buffer to another shard and pick bandwdith grant options that make sense. In this context "makes sense" means that the having this much bandwidth would cause the sender to send more receipts than the previous requested option, as described in the previous section.
 
 The simplest implementation would be to actually walk through the list of outgoing recepipts (starting from the ones that will be sent the soonest) and create a new option every time the total size increases by at least 100kB, like so:
 
@@ -126,7 +144,7 @@ fn make_bandwidth_request(buffered_receipts: Vec<Receipt>) -> Vec<bool> {
 }
 ```
 
-Walking over all receipts in the outgoing buffer is inefficient, so in reality it woud be better to implement a more efficient algorithm.
+Walking over all receipts in the outgoing buffer requires reading a lot of data from the Trie, so it woud be better to implement a more efficient algorithm.
 
 One idea for a more efficient algorithm would be to group receipts into groups of at least 50kB and calculate bandwidth requests using these groups. When a new receipt is added to the outgoing buffer, its added to the last group of receipts. If the size of the group goes above 50kB, a new group is started. When a receipt is removed, it's removed from the first group. If the size of the first group reaches zero, the group is removed.
 The number of groups will be small - each group of receipts is at least 50kB, so for 10MB of receipts there will be at most 200 groups. A group is a simple u32, we could keep all the groups in a single trie value similar to `TrieIndices`.
